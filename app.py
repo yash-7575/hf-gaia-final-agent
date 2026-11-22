@@ -32,7 +32,7 @@ from google.genai import types
 DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
 QUESTIONS_CACHE_FILE = "questions_cache.json"
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_FALLBACK_MODELS = list(
     dict.fromkeys(
         [GEMINI_MODEL]
@@ -40,7 +40,7 @@ GEMINI_FALLBACK_MODELS = list(
             m.strip()
             for m in os.getenv(
                 "GEMINI_FALLBACK_MODELS",
-                "gemini-2.5-flash-lite,gemini-2.0-flash",
+                "gemini-3.5-flash-lite,gemini-flash-latest,gemini-2.5-flash-lite",
             ).split(",")
             if m.strip()
         ]
@@ -538,8 +538,10 @@ def generate(contents: list[Any]) -> str:
                 last_error = exc
                 if _is_auth_error(exc):
                     raise RuntimeError(
-                        "GEMINI_API_KEY was rejected (401). Use a Google AI Studio key "
-                        "from https://aistudio.google.com/apikey — it starts with 'AIza'."
+                        "GEMINI_API_KEY was rejected by the Gemini API. Check that it is a "
+                        "Google AI Studio key (https://aistudio.google.com/apikey) created "
+                        "from a personal account, and that the project has the free tier or "
+                        "billing enabled (https://aistudio.google.com/billing)."
                     ) from exc
                 if _is_rate_limit(exc):
                     wait = 20 * (attempt + 1)
