@@ -1,8 +1,10 @@
+gradio[oauth]==5.25.2
 requests
 pandas
-gradio
 beautifulsoup4
 pypdf
 python-docx
 openpyxl
 google-genai
+ddgs
+youtube-transcript-api

@@ -1,718 +1,847 @@
-import os
-import re
+"""GAIA Final Agent — Hugging Face Agents Course, Unit 4.
+
+A genuine research agent (no hard-coded answers):
+  * searches the web and reads pages,
+  * parses attached files (PDF, DOCX, XLSX, CSV, code, images, audio),
+  * watches YouTube videos / transcripts,
+  * and reasons in a bounded ReAct loop before returning an exact-match answer.
+
+The Space exposes a Gradio UI that fetches the course questions, runs the agent
+and submits the answers to the official scoring endpoint.
+"""
+
 import io
 import json
-import time
 import mimetypes
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
 from typing import Any
-from urllib.parse import quote_plus, urlparse, parse_qs
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 import gradio as gr
-import requests
 import pandas as pd
+import requests
 from bs4 import BeautifulSoup
 from google import genai
 from google.genai import types
 
-
 DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
 QUESTIONS_CACHE_FILE = "questions_cache.json"
+
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-_configured_models = [GEMINI_MODEL] + [
-    model.strip()
-    for model in os.getenv(
-        "GEMINI_FALLBACK_MODELS",
-        "gemini-2.5-flash-lite,gemini-2.0-flash",
-    ).split(",")
-    if model.strip()
-]
-GEMINI_FALLBACK_MODELS = list(dict.fromkeys(_configured_models))
-OAuthProfileType = getattr(gr, "OAuthProfile", Any)
+GEMINI_FALLBACK_MODELS = list(
+    dict.fromkeys(
+        [GEMINI_MODEL]
+        + [
+            m.strip()
+            for m in os.getenv(
+                "GEMINI_FALLBACK_MODELS",
+                "gemini-2.5-flash-lite,gemini-2.0-flash",
+            ).split(",")
+            if m.strip()
+        ]
+    )
+)
 
-# Verified answers for the fixed 20-question Unit 4 GAIA subset.
-# Source:
-# https://huggingface.co/spaces/bstraehle/gaia/raw/30b20b0adfd220462108579f4feba2a43d157c12/data/gaia_validation_20.jsonl
-KNOWN_ANSWERS = {
-    "2d83110e-a098-4ebb-9987-066c06fa42d0": "Right",
-    "4fc2f1ae-8625-45b5-ab34-ad4433bc21f8": "FunkMonk",
-    "8e867cd7-cff9-4e6c-867a-ff5ddc2550be": "3",
-    "cabe07ed-9eca-40ea-8ead-410ef5e83f91": "Louvrier",
-    "305ac316-eef6-4446-960a-92d80d542f82": "Wojciech",
-    "3f57289b-8c60-48be-bd80-01f8099ca449": "519",
-    "cf106601-ab4f-4af9-b045-5295fe67b37d": "CUB",
-    "a0c07678-e491-4bbc-8f0b-07405144218f": "Yoshida, Uehara",
-    "5a0c1adf-205e-4841-a666-7c3ef95def9d": "Claus",
-    "bda648d7-d618-4883-88f4-3466eabd860e": "Saint Petersburg",
-    "a1e91b78-d3d8-4675-bb8d-62741b4b68a6": "3",
-    "cca530fc-4052-43b2-b130-b30968d8aa44": "Rd5",
-    "6f37996b-2ac7-44b0-8e68-6d28256631b4": "b, e",
-    "9d191bce-651d-4746-be2d-7ef8ecadb9c2": "Extremely",
-    "3cef3a44-215e-4aed-8e3b-b1e3f08063b7": "broccoli, celery, fresh basil, lettuce, sweet potatoes",
-    "99c9cc74-fdc8-46c6-8f8d-3ce2d3bfeea3": (
-        "cornstarch, freshly squeezed lemon juice, granulated sugar, "
-        "pure vanilla extract, ripe strawberries"
-    ),
-    "f918266a-b3e0-4914-865d-4faa564f1aef": "0",
-    "1f975693-876d-457b-a649-393859e79bf3": "132, 133, 134, 197, 245",
-    "840bfca7-4f7b-481a-8794-c560c340185d": "80GSFC21M0002",
-    "7bd855d8-463d-4ed5-93ca-5fe35145f733": "89706.00",
-}
+MAX_SEARCH_STEPS = int(os.getenv("MAX_SEARCH_STEPS", "4"))
+MAX_SEARCH_RESULTS = int(os.getenv("MAX_SEARCH_RESULTS", "6"))
+MAX_FETCHED_PAGES = int(os.getenv("MAX_FETCHED_PAGES", "2"))
+PAGE_CHARS = int(os.getenv("PAGE_CHARS", "6000"))
+FILE_CHARS = int(os.getenv("FILE_CHARS", "20000"))
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "8192"))
+REQUEST_TIMEOUT = 20
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+YOUTUBE_RE = re.compile(
+    r"https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)([\w-]{6,})",
+    re.IGNORECASE,
+)
 
 
-def clean_answer(text):
+# --------------------------------------------------------------------------- #
+# Text helpers
+# --------------------------------------------------------------------------- #
+def clean_answer(text: str) -> str:
+    """Normalise a model answer into the bare value expected by exact match."""
     if not text:
         return ""
 
     text = str(text).strip()
-    text = re.sub(r"(?i)^final answer\s*:\s*", "", text).strip()
-    text = re.sub(r"(?i)^answer\s*:\s*", "", text).strip()
-    text = re.sub(r"(?i)^the answer is\s*", "", text).strip()
-    text = text.strip("` \n\t")
+    text = re.sub(r"(?is)^```[a-zA-Z0-9]*\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
 
-    if len(text.splitlines()) > 1:
-        text = text.splitlines()[0].strip()
+    # Keep the meaningful line: models sometimes add a sentence of explanation.
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) > 1:
+        for line in lines:
+            if not re.match(r"(?i)^(thought|reasoning|explanation|note)\s*:", line):
+                text = line
+                break
+        else:
+            text = lines[-1]
 
+    text = re.sub(r"(?is)^(final\s+answer|answer)\s*[:\-]\s*", "", text)
+    text = re.sub(r"(?is)^the\s+answer\s+is\s*[:\-]?\s*", "", text)
+    text = text.strip().strip("`").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
     return text
 
 
-def direct_answer_heuristics(question):
-    q = question.strip()
-    reversed_q = q[::-1].lower()
-
-    if "if you understand this sentence" in reversed_q:
-        if '"left"' in reversed_q or "word left" in reversed_q:
-            return "right"
-        if '"right"' in reversed_q or "word right" in reversed_q:
-            return "left"
-
-    return None
+def _is_rate_limit(error: Exception) -> bool:
+    msg = str(error).lower()
+    return "429" in msg or "rate" in msg or "quota" in msg or "resource_exhausted" in msg
 
 
-def get_known_answer(task_id):
-    if not task_id:
-        return None
-    return KNOWN_ANSWERS.get(task_id)
+def _short_error(error: Exception) -> str:
+    return f"{type(error).__name__}: {str(error).strip()[:200]}"
 
 
-def get_gemini_api_key():
-    return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-
-
-def format_gemini_error(error):
-    message = str(error).strip().replace("\n", " ")
-    message = re.sub(r"\s+", " ", message)
-    return f"{type(error).__name__}: {message[:220]}"
-
-
-def call_gemini(question, web_context="", file_context="", file_bytes=None, mime_type=None):
-    api_key = get_gemini_api_key()
-
-    if not api_key:
-        return "GEMINI ERROR: missing GEMINI_API_KEY/GOOGLE_API_KEY"
-
-    prompt = f"""
-You are solving an exact-match benchmark question.
-
-Rules:
-- Return ONLY the final answer.
-- Do NOT explain.
-- Do NOT write "FINAL ANSWER".
-- Do NOT write "Answer:".
-- Do NOT add extra words.
-- If the answer is a number, return only the number unless a unit is clearly required.
-- Be careful with spelling, capitalization, dates, punctuation, and exact names.
-- Use the provided web/file context when useful.
-- If the question asks for a count, calculate carefully.
-
-Question:
-{question}
-
-File context:
-{file_context[:12000]}
-
-Web context:
-{web_context[:18000]}
-
-Return only the exact final answer:
-""".strip()
+# --------------------------------------------------------------------------- #
+# Web tools
+# --------------------------------------------------------------------------- #
+def web_search(query: str, max_results: int = MAX_SEARCH_RESULTS) -> list[dict]:
+    """DuckDuckGo search with a resilient HTML fallback."""
+    query = (query or "").strip()
+    if not query:
+        return []
 
     try:
-        client = genai.Client(api_key=api_key)
+        from ddgs import DDGS
 
-        contents = [prompt]
-
-        if file_bytes and mime_type and mime_type.startswith("image/"):
-            image_part = types.Part.from_bytes(
-                data=file_bytes,
-                mime_type=mime_type,
-            )
-            contents = [prompt, image_part]
-
-        last_error = None
-
-        for model_name in GEMINI_FALLBACK_MODELS:
-            for attempt in range(3):
-                try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=contents,
-                        config=types.GenerateContentConfig(
-                            temperature=0,
-                            max_output_tokens=128,
-                            thinking_config=types.ThinkingConfig(thinking_budget=0),
-                        ),
-                    )
-
-                    answer_text = clean_answer(getattr(response, "text", ""))
-                    if answer_text:
-                        return answer_text
-
-                    return f"GEMINI ERROR: empty response from {model_name}"
-
-                except Exception as e:
-                    last_error = e
-                    msg = str(e).lower()
-
-                    if "429" in msg or "rate" in msg or "quota" in msg:
-                        wait_time = 30 * (attempt + 1)
-                        print(
-                            f"Gemini rate limited on {model_name}. "
-                            f"Waiting {wait_time} seconds..."
-                        )
-                        time.sleep(wait_time)
-                        continue
-
-                    print(f"Gemini call failed on {model_name}: {format_gemini_error(e)}")
-                    break
-
-        if last_error is not None:
-            return f"GEMINI ERROR: {format_gemini_error(last_error)}"
-
-        return "GEMINI ERROR: unknown failure"
-
-    except Exception as e:
-        print(f"Gemini setup error: {format_gemini_error(e)}")
-        return f"GEMINI ERROR: {format_gemini_error(e)}"
-
-
-def ddg_search(query, max_results=5):
-    search_url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    results = []
+        with DDGS() as ddgs:
+            raw = list(ddgs.text(query, max_results=max_results))
+        results = []
+        for item in raw:
+            url = item.get("href") or item.get("url") or ""
+            if url:
+                results.append(
+                    {
+                        "title": item.get("title", ""),
+                        "url": url,
+                        "snippet": item.get("body", ""),
+                    }
+                )
+        if results:
+            return results
+    except Exception as exc:  # noqa: BLE001 - search backends fail often
+        print(f"[search] ddgs failed: {_short_error(exc)}")
 
     try:
-        response = requests.get(search_url, headers=headers, timeout=15)
+        response = requests.get(
+            f"https://html.duckduckgo.com/html/?q={quote_plus(query)}",
+            headers={"User-Agent": USER_AGENT},
+            timeout=REQUEST_TIMEOUT,
+        )
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
-
-        for result in soup.select(".result"):
-            title_tag = result.select_one(".result__a")
-            snippet_tag = result.select_one(".result__snippet")
-
+        results = []
+        for node in soup.select(".result"):
+            title_tag = node.select_one(".result__a")
             if not title_tag:
                 continue
-
-            title = title_tag.get_text(" ", strip=True)
             href = title_tag.get("href", "")
-            snippet = snippet_tag.get_text(" ", strip=True) if snippet_tag else ""
-
             if "uddg=" in href:
-                parsed = urlparse(href)
-                href = parse_qs(parsed.query).get("uddg", [href])[0]
-
-            if href:
-                results.append({"title": title, "url": href, "snippet": snippet})
-
+                href = parse_qs(urlparse(href).query).get("uddg", [href])[0]
+            snippet_tag = node.select_one(".result__snippet")
+            results.append(
+                {
+                    "title": title_tag.get_text(" ", strip=True),
+                    "url": href,
+                    "snippet": snippet_tag.get_text(" ", strip=True) if snippet_tag else "",
+                }
+            )
             if len(results) >= max_results:
                 break
+        return results
+    except Exception as exc:  # noqa: BLE001
+        print(f"[search] html fallback failed: {_short_error(exc)}")
+        return []
 
-    except Exception as e:
-        print(f"DuckDuckGo search error: {type(e).__name__}")
 
-    return results
-
-
-def fetch_page_text(url, max_chars=5000):
-    headers = {"User-Agent": "Mozilla/5.0"}
-
+def fetch_page_text(url: str, max_chars: int = PAGE_CHARS) -> str:
+    """Download a page (HTML or PDF) and return readable text."""
+    if not url or not url.startswith(("http://", "https://")):
+        return ""
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        response = requests.get(
+            url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT
+        )
         response.raise_for_status()
         content_type = response.headers.get("content-type", "").lower()
+
+        if "application/pdf" in content_type or url.lower().endswith(".pdf"):
+            try:
+                from pypdf import PdfReader
+
+                reader = PdfReader(io.BytesIO(response.content))
+                text = "\n".join((page.extract_text() or "") for page in reader.pages)
+                return re.sub(r"\s+", " ", text)[:max_chars]
+            except Exception:  # noqa: BLE001
+                return ""
 
         if "text/html" not in content_type and "text/plain" not in content_type:
             return ""
 
         soup = BeautifulSoup(response.text, "html.parser")
-
-        for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
+        for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "form"]):
             tag.decompose()
-
         text = soup.get_text(" ", strip=True)
-        text = re.sub(r"\s+", " ", text)
-
-        return text[:max_chars]
-
-    except Exception:
+        return re.sub(r"\s+", " ", text)[:max_chars]
+    except Exception as exc:  # noqa: BLE001
+        print(f"[fetch] {url[:60]} failed: {_short_error(exc)}")
         return ""
 
 
-def build_web_context(question):
-    results = ddg_search(question, max_results=5)
-    chunks = []
+def wikipedia_summary(query: str) -> str:
+    """Best-effort Wikipedia lookup, useful for entity questions."""
+    try:
+        search = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "query",
+                "list": "search",
+                "srsearch": query,
+                "format": "json",
+                "srlimit": 1,
+            },
+            headers={"User-Agent": USER_AGENT},
+            timeout=REQUEST_TIMEOUT,
+        )
+        search.raise_for_status()
+        hits = search.json().get("query", {}).get("search", [])
+        if not hits:
+            return ""
+        title = hits[0]["title"]
+        summary = requests.get(
+            f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote_plus(title)}",
+            headers={"User-Agent": USER_AGENT},
+            timeout=REQUEST_TIMEOUT,
+        )
+        summary.raise_for_status()
+        data = summary.json()
+        extract = data.get("extract", "")
+        return f"Wikipedia — {data.get('title', title)}:\n{extract[:2000]}" if extract else ""
+    except Exception:  # noqa: BLE001
+        return ""
 
-    for i, item in enumerate(results, start=1):
+
+def gather_search(query: str) -> str:
+    """Run a search and enrich it with page text + a Wikipedia summary."""
+    results = web_search(query)
+    if not results:
+        return f"No web results found for: {query}"
+
+    chunks = [f"SEARCH QUERY: {query}"]
+    for i, item in enumerate(results, 1):
         chunks.append(
-            f"[Search result {i}]\n"
-            f"Title: {item['title']}\n"
+            f"[{i}] {item['title']}\n"
             f"URL: {item['url']}\n"
-            f"Snippet: {item['snippet']}\n"
+            f"Snippet: {item['snippet']}"
         )
 
-    for i, item in enumerate(results[:3], start=1):
-        page_text = fetch_page_text(item["url"], max_chars=5000)
+    for item in results[:MAX_FETCHED_PAGES]:
+        page = fetch_page_text(item["url"])
+        if page:
+            chunks.append(f"[Page text from {item['url']}]\n{page}")
 
-        if page_text:
-            chunks.append(f"[Page content {i} from {item['url']}]\n{page_text}\n")
+    wiki = wikipedia_summary(query)
+    if wiki:
+        chunks.append(wiki)
 
     return "\n\n".join(chunks)
 
 
-def download_task_file(task_id):
-    file_url = f"{DEFAULT_API_URL}/files/{task_id}"
-
+def youtube_transcript(url: str) -> str:
+    """Fetch a YouTube transcript when the package is available."""
+    match = YOUTUBE_RE.search(url)
+    if not match:
+        return ""
     try:
-        response = requests.get(file_url, timeout=30)
+        from youtube_transcript_api import YouTubeTranscriptApi
 
+        video_id = match.group(1)
+        try:
+            fetched = YouTubeTranscriptApi().fetch(video_id)
+            pieces = [seg.text for seg in fetched]
+        except AttributeError:  # older library versions
+            fetched = YouTubeTranscriptApi.get_transcript(video_id)
+            pieces = [seg["text"] if isinstance(seg, dict) else str(seg) for seg in fetched]
+        text = " ".join(pieces)
+        return re.sub(r"\s+", " ", text)[:15000]
+    except Exception as exc:  # noqa: BLE001
+        print(f"[youtube] transcript failed: {_short_error(exc)}")
+        return ""
+
+
+# --------------------------------------------------------------------------- #
+# File tools
+# --------------------------------------------------------------------------- #
+def download_task_file(task_id: str):
+    """Download the file attached to a task, if any."""
+    if not task_id:
+        return None, None, None
+    try:
+        response = requests.get(
+            f"{DEFAULT_API_URL}/files/{task_id}", timeout=REQUEST_TIMEOUT + 10
+        )
         if response.status_code == 404:
             return None, None, None
-
         response.raise_for_status()
+
         content = response.content
         content_type = response.headers.get("content-type", "").split(";")[0].strip()
+        disposition = response.headers.get("content-disposition", "")
+        match = re.search(r'filename="?([^"]+)"?', disposition)
+        filename = match.group(1) if match else task_id
 
-        content_disposition = response.headers.get("content-disposition", "")
-        filename = task_id
-
-        match = re.search(r'filename="?([^"]+)"?', content_disposition)
-
-        if match:
-            filename = match.group(1)
-
-        guessed_type, _ = mimetypes.guess_type(filename)
-        mime_type = content_type or guessed_type or "application/octet-stream"
-
-        return filename, content, mime_type
-
-    except Exception as e:
-        print(f"File download skipped/error for {task_id}: {type(e).__name__}")
+        guessed, _ = mimetypes.guess_type(filename)
+        return filename, content, (content_type or guessed or "application/octet-stream")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[file] download failed for {task_id}: {_short_error(exc)}")
         return None, None, None
 
 
-def extract_file_text(filename, content, mime_type):
+def run_provided_python(code: str) -> str:
+    """Execute a benchmark-provided Python file in an isolated subprocess.
+
+    Only the downloaded file is executed (never model-generated code), in a
+    throw-away directory with a scrubbed environment and a hard timeout.
+    """
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "task_script.py")
+            with open(script, "w", encoding="utf-8") as handle:
+                handle.write(code)
+            env = {
+                "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                "PYTHONIOENCODING": "utf-8",
+                "HOME": tmp,
+            }
+            result = subprocess.run(
+                [sys.executable, "-I", script],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=env,
+                check=False,
+            )
+            output = (result.stdout or "").strip()
+            if result.stderr:
+                output += f"\n[stderr]\n{result.stderr.strip()}"
+            return output[:4000]
+    except subprocess.TimeoutExpired:
+        return "[execution timed out after 15s]"
+    except Exception as exc:  # noqa: BLE001
+        return f"[execution failed: {_short_error(exc)}]"
+
+
+def extract_file_text(filename: str, content: bytes, mime_type: str) -> str:
+    """Extract plain text from a file, when the format allows it."""
     if not content:
         return ""
-
     name = (filename or "").lower()
     mime = (mime_type or "").lower()
 
     try:
-        if (
-            "text" in mime
-            or name.endswith(
-                (
-                    ".txt",
-                    ".md",
-                    ".csv",
-                    ".json",
-                    ".xml",
-                    ".html",
-                    ".py",
-                    ".js",
-                    ".ts",
-                    ".log",
-                )
-            )
+        if mime.startswith("text/") or name.endswith(
+            (".txt", ".md", ".csv", ".json", ".xml", ".html", ".py", ".js", ".ts", ".log")
         ):
-            return content.decode("utf-8", errors="replace")[:20000]
+            return content.decode("utf-8", errors="replace")[:FILE_CHARS]
 
         if name.endswith(".pdf") or "pdf" in mime:
             from pypdf import PdfReader
 
             reader = PdfReader(io.BytesIO(content))
-            pages = []
-
-            for page in reader.pages:
-                pages.append(page.extract_text() or "")
-
-            return "\n".join(pages)[:20000]
+            pages = [(page.extract_text() or "") for page in reader.pages]
+            return "\n".join(pages)[:FILE_CHARS]
 
         if name.endswith(".docx"):
             import docx
 
-            doc = docx.Document(io.BytesIO(content))
-            return "\n".join(p.text for p in doc.paragraphs)[:20000]
+            document = docx.Document(io.BytesIO(content))
+            return "\n".join(p.text for p in document.paragraphs)[:FILE_CHARS]
 
         if name.endswith((".xlsx", ".xls")):
-            excel = pd.read_excel(io.BytesIO(content), sheet_name=None)
+            sheets = pd.read_excel(io.BytesIO(content), sheet_name=None)
             chunks = []
-
-            for sheet_name, df in excel.items():
+            for sheet_name, frame in sheets.items():
                 chunks.append(f"Sheet: {sheet_name}")
-                chunks.append(df.to_string(index=False))
-
-            return "\n\n".join(chunks)[:20000]
-
-    except Exception as e:
-        return f"Could not extract file text: {type(e).__name__}"
+                chunks.append(frame.to_string(index=False))
+            return "\n\n".join(chunks)[:FILE_CHARS]
+    except Exception as exc:  # noqa: BLE001
+        return f"[could not extract file text: {_short_error(exc)}]"
 
     return ""
 
 
-class GeminiAgent:
-    def __init__(self, delay_seconds=12):
-        self.delay_seconds = delay_seconds
-        print("GeminiAgent initialized.")
+def build_file_context(task_id: str, file_name: str):
+    """Return (text_context, multimodal_parts, notes) for an attached file."""
+    if not task_id or not file_name:
+        return "", [], ""
 
-    def __call__(self, question, task_id=None, file_name=None):
-        print("\n" + "-" * 60)
-        print(f"Question: {question[:150]}")
+    filename, content, mime_type = download_task_file(task_id)
+    if not content:
+        return "", [], ""
 
-        known_answer = get_known_answer(task_id)
+    name = (filename or "").lower()
+    mime = (mime_type or "").lower()
+    parts: list[Any] = []
+    notes = f"Attached file: {filename} ({mime_type}, {len(content)} bytes)"
 
-        if known_answer is not None:
-            print(f"Known answer used for task {task_id}: {known_answer}")
-            return clean_answer(known_answer)
+    if mime.startswith("image/"):
+        try:
+            parts.append(types.Part.from_bytes(data=content, mime_type=mime_type))
+            return "", parts, notes + " — inspect the image directly."
+        except Exception as exc:  # noqa: BLE001
+            return "", [], notes + f" — image attach failed: {_short_error(exc)}"
 
-        direct = direct_answer_heuristics(question)
+    if mime.startswith("audio/"):
+        try:
+            parts.append(types.Part.from_bytes(data=content, mime_type=mime_type))
+            return "", parts, notes + " — listen to the audio directly."
+        except Exception as exc:  # noqa: BLE001
+            return "", [], notes + f" — audio attach failed: {_short_error(exc)}"
 
-        if direct is not None:
-            print(f"Direct answer: {direct}")
-            return clean_answer(direct)
+    if mime.startswith("video/") and len(content) < 15 * 1024 * 1024:
+        try:
+            parts.append(types.Part.from_bytes(data=content, mime_type=mime_type))
+            return "", parts, notes + " — watch the video directly."
+        except Exception as exc:  # noqa: BLE001
+            print(f"[file] video attach failed: {_short_error(exc)}")
 
-        file_content = None
-        mime_type = None
-        file_context = ""
+    text = extract_file_text(filename, content, mime_type)
 
-        if task_id and file_name:
-            downloaded_filename, file_content, mime_type = download_task_file(task_id)
+    if name.endswith(".py") and text:
+        execution = run_provided_python(text)
+        if execution:
+            text += f"\n\n--- Python execution output ---\n{execution}"
 
-            if file_content:
-                file_context = extract_file_text(downloaded_filename, file_content, mime_type)
+    return text, parts, notes
 
-                print(
-                    f"Downloaded file: {downloaded_filename}, "
-                    f"mime: {mime_type}, "
-                    f"text chars: {len(file_context)}"
-                )
 
-        web_context = build_web_context(question)
-        print(f"Web context chars: {len(web_context)}")
+# --------------------------------------------------------------------------- #
+# Gemini
+# --------------------------------------------------------------------------- #
+def get_gemini_api_key() -> str | None:
+    return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
-        print(f"Waiting {self.delay_seconds} seconds before Gemini call...")
-        time.sleep(self.delay_seconds)
 
-        answer = call_gemini(
-            question=question,
-            web_context=web_context,
-            file_context=file_context,
-            file_bytes=file_content,
-            mime_type=mime_type,
+_CLIENT: Any = None
+
+
+def get_client():
+    global _CLIENT
+    if _CLIENT is None:
+        api_key = get_gemini_api_key()
+        if not api_key:
+            raise RuntimeError(
+                "Missing GEMINI_API_KEY (or GOOGLE_API_KEY). Add it as a Space secret."
+            )
+        _CLIENT = genai.Client(api_key=api_key)
+    return _CLIENT
+
+
+def config_for_model(model_name: str) -> types.GenerateContentConfig:
+    """Temperature 0, with a bounded thinking budget on 2.5 models only."""
+    kwargs: dict[str, Any] = {
+        "temperature": 0,
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
+    }
+    if model_name.startswith("gemini-2.5"):
+        kwargs["thinking_config"] = types.ThinkingConfig(
+            thinking_budget=int(os.getenv("GEMINI_THINKING_BUDGET", "2048"))
         )
-
-        answer = clean_answer(answer)
-        print(f"Answer: {answer}")
-
-        return answer
+    return types.GenerateContentConfig(**kwargs)
 
 
-def fetch_questions():
+def generate(contents: list[Any]) -> str:
+    """Call Gemini with model fallbacks and rate-limit retries."""
+    client = get_client()
+
+    last_error: Exception | None = None
+    for model_name in GEMINI_FALLBACK_MODELS:
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config_for_model(model_name),
+                )
+                text = (getattr(response, "text", "") or "").strip()
+                if text:
+                    return text
+                last_error = RuntimeError(f"empty response from {model_name}")
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if _is_rate_limit(exc):
+                    wait = 20 * (attempt + 1)
+                    print(f"[gemini] rate limited on {model_name}; sleeping {wait}s")
+                    time.sleep(wait)
+                    continue
+                print(f"[gemini] {model_name} failed: {_short_error(exc)}")
+                break
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Gemini call failed for an unknown reason")
+
+
+def parse_action(text: str):
+    """Parse the ReAct response into ('search', query) or ('answer', value)."""
+    raw = (text or "").strip()
+
+    action_match = re.search(r"(?im)^\s*ACTION\s*:\s*(SEARCH|ANSWER)\b", raw)
+    if action_match:
+        action = action_match.group(1).upper()
+        if action == "SEARCH":
+            query_match = re.search(r"(?is)^\s*QUERY\s*:\s*(.+)$", raw[action_match.end():])
+            if query_match:
+                return "search", query_match.group(1).strip().strip("\"'")
+            # Model may have written "ACTION: SEARCH: query" on one line.
+            tail = raw[action_match.end():].strip().lstrip(":-").strip()
+            return ("search", tail) if tail else ("search", None)
+
+        answer_match = re.search(r"(?is)^\s*ANSWER\s*:\s*(.+)$", raw[action_match.end():])
+        if answer_match:
+            return "answer", answer_match.group(1).strip()
+        tail = raw[action_match.end():].strip().lstrip(":-").strip()
+        return ("answer", tail) if tail else ("answer", "")
+
+    # Tolerate shorthand like "SEARCH: ..." or a bare final answer.
+    shorthand = re.match(r"(?is)^\s*SEARCH\s*[:\-]\s*(.+)$", raw)
+    if shorthand:
+        return "search", shorthand.group(1).strip()
+
+    return "answer", raw
+
+
+def build_prompt(question: str, observations: list[str], step: int, file_note: str) -> str:
+    evidence = "\n\n".join(observations) if observations else "No evidence gathered yet."
+    remaining = MAX_SEARCH_STEPS - step
+    return f"""You are an expert research agent solving a question from the GAIA benchmark.
+Answers are graded by EXACT string match, so precision is critical.
+
+You can search the web. Reply in EXACTLY ONE of these two formats:
+
+To search:
+THOUGHT: <one short sentence>
+ACTION: SEARCH
+QUERY: <a concise, specific search query>
+
+To finish:
+THOUGHT: <one short sentence>
+ACTION: ANSWER
+ANSWER: <the final answer ONLY>
+
+Rules for the final answer:
+- Output ONLY the answer value — no explanation, no "Answer:", no "FINAL ANSWER".
+- Do not wrap the answer in quotes.
+- Use the exact spelling, capitalisation and punctuation the question implies.
+- If a number is requested, output just the number (keep decimals when required).
+- If a list is requested, use a comma+space separated list in the requested order.
+- Base every claim on the evidence below; never invent facts.
+
+{file_note}
+
+QUESTION:
+{question}
+
+EVIDENCE GATHERED SO FAR:
+{evidence}
+
+You have {remaining} search step(s) left. Search again if the evidence is not enough,
+otherwise give the final answer.
+"""
+
+
+def build_force_answer_prompt(question: str, observations: list[str], file_note: str) -> str:
+    evidence = "\n\n".join(observations) if observations else "No evidence gathered."
+    return f"""You must now give your best final answer to the question below.
+Return ONLY the answer value — no explanation, no labels, no quotes.
+Use exact spelling, capitalisation, punctuation and formatting.
+
+{file_note}
+
+QUESTION:
+{question}
+
+EVIDENCE:
+{evidence}
+""".strip()
+
+
+class GaiaAgent:
+    """A bounded ReAct research agent built on Gemini + web tools."""
+
+    def __init__(self, delay_seconds: float = 1.0):
+        self.delay_seconds = delay_seconds
+
+    def __call__(self, question: str, task_id: str | None = None, file_name: str | None = None) -> str:
+        print("\n" + "-" * 70)
+        print(f"[agent] {question[:160]}")
+
+        file_text, file_parts, file_note = build_file_context(task_id, file_name or "")
+        observations: list[str] = []
+        if file_text:
+            observations.append(f"ATTACHED FILE CONTENT:\n{file_text}")
+
+        # YouTube links: give the model the video itself and a transcript fallback.
+        youtube_parts: list[Any] = []
+        for url in YOUTUBE_RE.findall(question):
+            full = f"https://www.youtube.com/watch?v={url}"
+            try:
+                youtube_parts.append(
+                    types.Part(file_data=types.FileData(file_uri=full))
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[youtube] attach failed: {_short_error(exc)}")
+            transcript = youtube_transcript(full)
+            if transcript:
+                observations.append(f"YOUTUBE TRANSCRIPT ({full}):\n{transcript}")
+
+        all_parts = file_parts + youtube_parts
+
+        try:
+            for step in range(MAX_SEARCH_STEPS):
+                prompt = build_prompt(question, observations, step, file_note)
+                raw = generate([prompt] + all_parts)
+                action, payload = parse_action(raw)
+                print(f"[agent] step {step + 1}: {action} -> {str(payload)[:100]}")
+
+                if action == "answer":
+                    answer = clean_answer(payload)
+                    if answer:
+                        print(f"[agent] answer: {answer}")
+                        return answer
+                    break
+
+                if not payload:
+                    observations.append("The last search had no query; try a different query.")
+                    continue
+
+                observations.append(gather_search(payload))
+                time.sleep(self.delay_seconds)
+
+            final_raw = generate(
+                [build_force_answer_prompt(question, observations, file_note)] + all_parts
+            )
+            answer = clean_answer(parse_action(final_raw)[1])
+            print(f"[agent] final answer: {answer}")
+            return answer
+
+        except Exception as exc:  # noqa: BLE001
+            print(f"[agent] failed: {_short_error(exc)}")
+            if observations:
+                return "Unable to determine"
+            raise
+
+
+# --------------------------------------------------------------------------- #
+# Course API
+# --------------------------------------------------------------------------- #
+def fetch_questions() -> list[dict]:
     if os.path.exists(QUESTIONS_CACHE_FILE):
         try:
-            with open(QUESTIONS_CACHE_FILE, "r", encoding="utf-8") as f:
-                cached_questions = json.load(f)
-
-            if cached_questions:
-                print("Using cached questions.")
-                return cached_questions
-
-        except Exception:
+            with open(QUESTIONS_CACHE_FILE, "r", encoding="utf-8") as handle:
+                cached = json.load(handle)
+            if cached:
+                print("[api] using cached questions")
+                return cached
+        except Exception:  # noqa: BLE001
             pass
 
-    questions_url = f"{DEFAULT_API_URL}/questions"
-
     for attempt in range(3):
-        response = requests.get(questions_url, timeout=15)
-
+        response = requests.get(f"{DEFAULT_API_URL}/questions", timeout=REQUEST_TIMEOUT)
         if response.status_code == 429:
-            wait_time = 20 * (attempt + 1)
-            print(f"Questions API rate limited. Waiting {wait_time} seconds...")
-            time.sleep(wait_time)
+            wait = 15 * (attempt + 1)
+            print(f"[api] questions rate limited; sleeping {wait}s")
+            time.sleep(wait)
             continue
-
         response.raise_for_status()
         questions = response.json()
-
-        with open(QUESTIONS_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(questions, f, ensure_ascii=False, indent=2)
-
+        with open(QUESTIONS_CACHE_FILE, "w", encoding="utf-8") as handle:
+            json.dump(questions, handle, ensure_ascii=False, indent=2)
         return questions
 
-    raise Exception("Could not fetch questions because API is rate limited.")
+    raise RuntimeError("Could not fetch questions: the API is rate limited.")
 
 
-def fetch_questions_only():
-    try:
-        questions_data = fetch_questions()
-        rows = []
+# --------------------------------------------------------------------------- #
+# UI actions
+# --------------------------------------------------------------------------- #
+def _run(limit: int, submit: bool, profile, progress) -> tuple[str, pd.DataFrame]:
+    if submit and not profile:
+        return "Please log in with Hugging Face before submitting.", None
 
-        for item in questions_data:
-            rows.append(
-                {
-                    "Task ID": item.get("task_id", ""),
-                    "Question": item.get("question", ""),
-                    "File Name": item.get("file_name", ""),
-                }
-            )
-
-        return f"Fetched {len(rows)} questions successfully. No answers submitted.", pd.DataFrame(rows)
-
-    except Exception as e:
-        return f"Error fetching questions: {e}", None
-
-
-def clear_question_cache():
-    try:
-        if os.path.exists(QUESTIONS_CACHE_FILE):
-            os.remove(QUESTIONS_CACHE_FILE)
-            return "Question cache cleared.", None
-
-        return "No question cache found.", None
-
-    except Exception as e:
-        return f"Error clearing cache: {e}", None
-
-
-def run_agent_only(max_questions):
-    try:
-        questions_data = fetch_questions()
-    except Exception as e:
-        return f"Error fetching questions: {e}", None
+    if not get_gemini_api_key():
+        return (
+            "Missing GEMINI_API_KEY. Add it under Settings → Variables and secrets "
+            "in this Space, then restart.",
+            None,
+        )
 
     try:
-        max_questions = int(max_questions)
-    except Exception:
-        max_questions = 3
+        questions = fetch_questions()
+    except Exception as exc:  # noqa: BLE001
+        return f"Error fetching questions: {_short_error(exc)}", None
 
-    if max_questions <= 0:
-        max_questions = len(questions_data)
+    if not questions:
+        return "The question list is empty.", None
 
-    questions_to_run = questions_data[:max_questions]
-    agent = GeminiAgent(delay_seconds=12)
-    results_log = []
+    try:
+        limit = int(limit)
+    except Exception:  # noqa: BLE001
+        limit = 0
+    selected = questions if limit <= 0 else questions[:limit]
 
-    for item in questions_to_run:
+    agent = GaiaAgent()
+    rows: list[dict] = []
+    payload: list[dict] = []
+
+    for index, item in enumerate(selected):
         task_id = item.get("task_id", "")
-        question_text = item.get("question", "")
+        question = item.get("question", "")
         file_name = item.get("file_name", "")
+        progress((index) / max(len(selected), 1), desc=f"Question {index + 1}/{len(selected)}")
 
         try:
-            submitted_answer = agent(
-                question=question_text,
-                task_id=task_id,
-                file_name=file_name,
-            )
+            answer = clean_answer(agent(question, task_id=task_id, file_name=file_name))
+        except Exception as exc:  # noqa: BLE001
+            answer = "Unable to determine"
+            print(f"[run] task {task_id} failed: {_short_error(exc)}")
 
-        except Exception as e:
-            submitted_answer = f"AGENT ERROR: {type(e).__name__}"
+        if not answer:
+            answer = "Unable to determine"
 
-        results_log.append(
+        payload.append({"task_id": task_id, "submitted_answer": answer})
+        rows.append(
             {
                 "Task ID": task_id,
-                "Question": question_text,
-                "File Name": file_name,
-                "Submitted Answer": submitted_answer,
+                "Question": question,
+                "File": file_name,
+                "Answer": answer,
             }
         )
 
-    return (
-        f"Agent finished on {len(questions_to_run)} question(s). No answers submitted yet.",
-        pd.DataFrame(results_log),
+    frame = pd.DataFrame(rows)
+
+    if not submit:
+        return (
+            f"Test run finished on {len(selected)} question(s). "
+            "Nothing was submitted — review the answers above.",
+            frame,
+        )
+
+    space_id = os.getenv("SPACE_ID", "")
+    agent_code = (
+        f"https://huggingface.co/spaces/{space_id}/tree/main"
+        if space_id
+        else "SPACE_ID_NOT_FOUND"
     )
 
-
-def run_and_submit_all(profile: OAuthProfileType | None = None):
-    if profile:
-        username = f"{profile.username}"
-    else:
-        return "Please login to Hugging Face first.", None
-
-    space_id = os.getenv("SPACE_ID")
-
-    if space_id:
-        agent_code = f"https://huggingface.co/spaces/{space_id}/tree/main"
-    else:
-        agent_code = "SPACE_ID_NOT_FOUND"
-
-    try:
-        questions_data = fetch_questions()
-    except Exception as e:
-        return f"Error fetching questions: {e}", None
-
-    agent = GeminiAgent(delay_seconds=15)
-    results_log = []
-    answers_payload = []
-
-    for item in questions_data:
-        task_id = item.get("task_id", "")
-        question_text = item.get("question", "")
-        file_name = item.get("file_name", "")
-
-        if not task_id or not question_text:
-            continue
-
-        try:
-            submitted_answer = agent(
-                question=question_text,
-                task_id=task_id,
-                file_name=file_name,
-            )
-
-            submitted_answer = clean_answer(submitted_answer)
-
-            answers_payload.append(
-                {
-                    "task_id": task_id,
-                    "submitted_answer": submitted_answer,
-                }
-            )
-
-        except Exception as e:
-            submitted_answer = f"AGENT ERROR: {type(e).__name__}"
-
-        results_log.append(
-            {
-                "Task ID": task_id,
-                "Question": question_text,
-                "File Name": file_name,
-                "Submitted Answer": submitted_answer,
-            }
-        )
-
-    if not answers_payload:
-        return "Agent did not produce any answers to submit.", pd.DataFrame(results_log)
-
-    submission_data = {
-        "username": username.strip(),
+    submission = {
+        "username": profile.username.strip(),
         "agent_code": agent_code,
-        "answers": answers_payload,
+        "answers": payload,
     }
 
-    submit_url = f"{DEFAULT_API_URL}/submit"
-
     try:
-        response = requests.post(submit_url, json=submission_data, timeout=60)
-        response.raise_for_status()
-        result_data = response.json()
-
-        final_status = (
-            f"Submission Successful!\n"
-            f"User: {result_data.get('username')}\n"
-            f"Overall Score: {result_data.get('score', 'N/A')}% "
-            f"({result_data.get('correct_count', '?')}/{result_data.get('total_attempted', '?')} correct)\n"
-            f"Message: {result_data.get('message', 'No message received.')}"
+        response = requests.post(
+            f"{DEFAULT_API_URL}/submit", json=submission, timeout=90
         )
+        response.raise_for_status()
+        result = response.json()
+        status = (
+            "Submission successful!\n"
+            f"User: {result.get('username')}\n"
+            f"Score: {result.get('score', 'N/A')}% "
+            f"({result.get('correct_count', '?')}/{result.get('total_attempted', '?')} correct)\n"
+            f"Message: {result.get('message', 'No message received.')}"
+        )
+        return status, frame
+    except requests.exceptions.HTTPError as exc:
+        detail = ""
+        if exc.response is not None:
+            try:
+                detail = exc.response.json().get("detail", exc.response.text[:300])
+            except Exception:  # noqa: BLE001
+                detail = exc.response.text[:300]
+        return f"Submission failed (HTTP {getattr(exc.response, 'status_code', '?')}): {detail}", frame
+    except Exception as exc:  # noqa: BLE001
+        return f"Submission failed: {_short_error(exc)}", frame
 
-        return final_status, pd.DataFrame(results_log)
 
-    except requests.exceptions.HTTPError as e:
-        status_code = e.response.status_code if e.response is not None else "unknown"
-
-        try:
-            error_json = e.response.json()
-            detail = error_json.get("detail", "No detail")
-        except Exception:
-            detail = "No detail"
-
-        return f"Submission Failed: HTTP {status_code}. Detail: {detail}", pd.DataFrame(results_log)
-
-    except Exception as e:
-        return f"Submission Failed: {type(e).__name__}", pd.DataFrame(results_log)
+def run_evaluation(profile: gr.OAuthProfile | None, limit, progress=gr.Progress()):
+    return _run(limit, submit=True, profile=profile, progress=progress)
 
 
-with gr.Blocks() as demo:
-    gr.Markdown("# GAIA Final Agent Evaluation Runner")
+def run_test(limit, progress=gr.Progress()):
+    return _run(limit, submit=False, profile=None, progress=progress)
 
+
+with gr.Blocks(title="GAIA Final Agent") as demo:
     gr.Markdown(
         """
-        **Flow:**
+        # 🕵️ GAIA Final Agent
+        A research agent for the **Hugging Face Agents Course — Unit 4**.
+        It searches the web, reads attached files (PDF, DOCX, XLSX, CSV, code,
+        images, audio), watches YouTube videos, and returns exact-match answers.
 
-        1. Click **Fetch Questions Only - Safe Test**.
-        2. Use **Run Agent Only - No Submit** with 3 questions first.
-        3. Review answers.
-        4. Login with Hugging Face.
-        5. Click **Run Evaluation & Submit All Answers** only when ready.
+        **How to use**
+        1. Log in with Hugging Face (used as your leaderboard username).
+        2. Optionally run a **Test** on a few questions first (nothing is submitted).
+        3. Click **Run & Submit All Answers**. This can take 10–25 minutes.
         """
     )
 
     gr.LoginButton()
 
-    max_questions_input = gr.Number(
-        label="Max questions for safe test. Use 3 first. Use 0 for all.",
-        value=3,
-        precision=0,
-    )
+    with gr.Row():
+        limit_input = gr.Number(
+            label="Questions to run (0 = all 20)",
+            value=0,
+            precision=0,
+            minimum=0,
+        )
 
-    fetch_button = gr.Button("Fetch Questions Only - Safe Test")
-    clear_cache_button = gr.Button("Clear Question Cache")
-    test_agent_button = gr.Button("Run Agent Only - No Submit")
-    run_button = gr.Button("Run Evaluation & Submit All Answers")
+    with gr.Row():
+        test_button = gr.Button("Test Only — Do Not Submit")
+        submit_button = gr.Button("Run & Submit All Answers", variant="primary")
 
     status_output = gr.Textbox(
-        label="Run Status / Submission Result",
-        lines=6,
-        interactive=False,
+        label="Run Status / Submission Result", lines=7, interactive=False
     )
+    results_table = gr.DataFrame(label="Questions and Answers", wrap=True)
 
-    results_table = gr.DataFrame(
-        label="Questions and Agent Answers",
-        wrap=True,
-    )
-
-    fetch_button.click(
-        fn=fetch_questions_only,
+    test_button.click(
+        fn=run_test,
+        inputs=[limit_input],
         outputs=[status_output, results_table],
     )
-
-    clear_cache_button.click(
-        fn=clear_question_cache,
-        outputs=[status_output, results_table],
-    )
-
-    test_agent_button.click(
-        fn=run_agent_only,
-        inputs=[max_questions_input],
-        outputs=[status_output, results_table],
-    )
-
-    run_button.click(
-        fn=run_and_submit_all,
+    submit_button.click(
+        fn=run_evaluation,
+        inputs=[limit_input],
         outputs=[status_output, results_table],
     )
 
 
 if __name__ == "__main__":
     print("\n" + "-" * 30 + " App Starting " + "-" * 30)
-
-    space_host_startup = os.getenv("SPACE_HOST")
-    space_id_startup = os.getenv("SPACE_ID")
-
-    if space_host_startup:
-        print(f"SPACE_HOST found: {space_host_startup}")
-
-    if space_id_startup:
-        print(f"SPACE_ID found: {space_id_startup}")
-        print(f"Repo Tree URL: https://huggingface.co/spaces/{space_id_startup}/tree/main")
-
+    if os.getenv("SPACE_ID"):
+        print(f"SPACE_ID: {os.getenv('SPACE_ID')}")
+        print(f"Repo: https://huggingface.co/spaces/{os.getenv('SPACE_ID')}/tree/main")
+    if os.getenv("SPACE_HOST"):
+        print(f"Runtime: https://{os.getenv('SPACE_HOST')}.hf.space")
     print("-" * 75 + "\n")
-    demo.launch(debug=True, share=False)
+
+    demo.queue(default_concurrency_limit=1)
+    demo.launch()

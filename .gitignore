@@ -1,5 +1,7 @@
 __pycache__/
-*.pyc
+*.py[cod]
 questions_cache.json
 .env
 .venv/
+venv/
+.DS_Store
