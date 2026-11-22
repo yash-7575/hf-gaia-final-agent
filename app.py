@@ -823,15 +823,21 @@ class GaiaAgent:
 
     def __init__(self, delay_seconds: float = 1.0):
         self.delay_seconds = delay_seconds
+        self.last_trace: list[dict[str, Any]] = []
+        self.last_observations: list[str] = []
 
     def __call__(self, question: str, task_id: str | None = None, file_name: str | None = None) -> str:
         print("\n" + "-" * 70)
         print(f"[agent] {question[:160]}")
+        self.last_trace = []
+        self.last_observations = []
 
         file_text, file_parts, file_note = build_file_context(task_id, file_name or "")
         observations: list[str] = []
         if file_text:
             observations.append(f"ATTACHED FILE CONTENT:\n{file_text}")
+        if file_note:
+            self.last_trace.append({"action": "read_file", "detail": file_note})
 
         # YouTube links: give the model the video itself and a transcript fallback.
         youtube_parts: list[Any] = []
@@ -865,6 +871,10 @@ class GaiaAgent:
                     answer = clean_answer(payload)
                     if answer:
                         print(f"[agent] answer: {answer}")
+                        self.last_trace.append(
+                            {"action": "answer", "detail": answer, "raw": raw[:2000]}
+                        )
+                        self.last_observations = observations
                         return answer
                     break
 
@@ -872,6 +882,7 @@ class GaiaAgent:
                     observations.append("The last search had no query; try a different query.")
                     continue
 
+                self.last_trace.append({"action": "search", "detail": payload})
                 observations.append(gather_search(payload))
                 time.sleep(self.delay_seconds)
 
@@ -880,11 +891,15 @@ class GaiaAgent:
             )
             answer = clean_answer(parse_action(final_raw)[1])
             print(f"[agent] final answer: {answer}")
+            self.last_trace.append({"action": "final_answer", "detail": answer})
+            self.last_observations = observations
             return answer
 
         except Exception as exc:  # noqa: BLE001
             print(f"[agent] failed: {_short_error(exc)}")
             if observations:
+                self.last_observations = observations
+                self.last_trace.append({"action": "error", "detail": _short_error(exc)})
                 return "Unable to determine"
             raise
 

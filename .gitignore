@@ -3,5 +3,7 @@ __pycache__/
 questions_cache.json
 .env
 .venv/
+.venv312/
 venv/
+gaia_submission.jsonl
 .DS_Store
