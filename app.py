@@ -32,6 +32,24 @@ from google.genai import types
 DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
 QUESTIONS_CACHE_FILE = "questions_cache.json"
 
+# Groq configuration
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_FALLBACK_MODELS = list(
+    dict.fromkeys(
+        [GROQ_MODEL]
+        + [
+            m.strip()
+            for m in os.getenv(
+                "GROQ_FALLBACK_MODELS",
+                "openai/gpt-oss-120b,openai/gpt-oss-20b",
+            ).split(",")
+            if m.strip()
+        ]
+    )
+)
+
+# Gemini configuration (existing)
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_FALLBACK_MODELS = list(
     dict.fromkeys(
@@ -64,6 +82,23 @@ YOUTUBE_RE = re.compile(
     r"https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)([\w-]{6,})",
     re.IGNORECASE,
 )
+
+# --------------------------------------------------------------------------- #
+# Provider detection
+# --------------------------------------------------------------------------- #
+def get_provider() -> str:
+    """Determine which LLM provider to use based on available API keys.
+    Priority: Groq (if GROQ_API_KEY set) -> Gemini (if GEMINI_API_KEY/GOOGLE_API_KEY set).
+    """
+    if GROQ_API_KEY:
+        return "groq"
+    if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
+        return "gemini"
+    return "none"
+
+
+def get_gemini_api_key() -> str | None:
+    return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 
 # --------------------------------------------------------------------------- #
@@ -107,13 +142,29 @@ def _is_rate_limit(error: Exception) -> bool:
     )
 
 
-def _is_auth_error(error: Exception) -> bool:
+def _is_groq_auth_error(error: Exception) -> bool:
+    msg = str(error).lower()
+    return (
+        "401" in msg
+        or "403" in msg
+        or "unauthorized" in msg
+        or "invalid api key" in msg
+        or "authentication failed" in msg
+        or "permission denied" in msg
+    )
+
+
+def _is_gemini_auth_error(error: Exception) -> bool:
     msg = str(error).lower()
     return (
         "api key not valid" in msg
         or "unauthenticated" in msg
         or "permission denied" in msg
     )
+
+
+def _is_auth_error(error: Exception) -> bool:
+    return _is_groq_auth_error(error) or _is_gemini_auth_error(error)
 
 
 def _short_error(error: Exception) -> str:
@@ -309,7 +360,6 @@ def youtube_transcript(url: str) -> str:
         print(f"[youtube] transcript failed: {_short_error(exc)}")
         return ""
 
-
 # --------------------------------------------------------------------------- #
 # File tools
 # --------------------------------------------------------------------------- #
@@ -412,8 +462,32 @@ def extract_file_text(filename: str, content: bytes, mime_type: str) -> str:
     return ""
 
 
+def transcribe_audio_groq(content: bytes, filename: str, mime_type: str) -> str:
+    """Transcribe audio using Groq's Whisper API."""
+    try:
+        files = {
+            "file": (filename, content, mime_type),
+            "model": (None, "whisper-large-v3-turbo"),
+        }
+        response = requests.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            files=files,
+            timeout=120,
+        )
+        response.raise_for_status()
+        return response.json().get("text", "")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[groq] audio transcription failed: {_short_error(exc)}")
+        return f"[audio transcription failed: {_short_error(exc)}]"
+
+
 def build_file_context(task_id: str, file_name: str):
-    """Return (text_context, multimodal_parts, notes) for an attached file."""
+    """Return (text_context, multimodal_parts, notes) for an attached file.
+    
+    For Groq provider, returns structured data instead of genai Parts since
+    gpt-oss is text-only and can't process images/audio directly.
+    """
     if not task_id or not file_name:
         return "", [], ""
 
@@ -423,30 +497,50 @@ def build_file_context(task_id: str, file_name: str):
 
     name = (filename or "").lower()
     mime = (mime_type or "").lower()
-    parts: list[Any] = []
+    parts: list[Any] = []  # For Gemini path
     notes = f"Attached file: {filename} ({mime_type}, {len(content)} bytes)"
 
+    # Image handling - Gemini can process, Groq cannot
     if mime.startswith("image/"):
+        provider = get_provider()
+        if provider == "groq":
+            # gpt-oss is text-only, can't view images
+            return "", [], notes + " — [Groq provider] image could not be viewed (gpt-oss is text-only)"
         try:
             parts.append(types.Part.from_bytes(data=content, mime_type=mime_type))
             return "", parts, notes + " — inspect the image directly."
         except Exception as exc:  # noqa: BLE001
             return "", [], notes + f" — image attach failed: {_short_error(exc)}"
 
+    # Audio handling - Gemini can process, Groq needs transcription
     if mime.startswith("audio/"):
+        provider = get_provider()
+        if provider == "groq":
+            # Transcribe audio instead of attaching
+            transcript = transcribe_audio_groq(content, filename, mime_type)
+            if transcript:
+                text = extract_file_text(filename, content, mime_type)
+                combined = text + f"\n\n--- Audio transcript ---\n{transcript}" if text else transcript
+                return combined, [], notes + " — audio transcribed via Whisper"
+            return "", [], notes + " — audio transcription failed"
         try:
             parts.append(types.Part.from_bytes(data=content, mime_type=mime_type))
             return "", parts, notes + " — listen to the audio directly."
         except Exception as exc:  # noqa: BLE001
             return "", [], notes + f" — audio attach failed: {_short_error(exc)}"
 
+    # Video handling - only Gemini for small videos
     if mime.startswith("video/") and len(content) < 15 * 1024 * 1024:
+        provider = get_provider()
+        if provider == "groq":
+            return "", [], notes + " — [Groq provider] video could not be viewed (gpt-oss is text-only)"
         try:
             parts.append(types.Part.from_bytes(data=content, mime_type=mime_type))
             return "", parts, notes + " — watch the video directly."
         except Exception as exc:  # noqa: BLE001
             print(f"[file] video attach failed: {_short_error(exc)}")
 
+    # Text extraction for all other file types
     text = extract_file_text(filename, content, mime_type)
 
     if name.endswith(".py") and text:
@@ -458,12 +552,79 @@ def build_file_context(task_id: str, file_name: str):
 
 
 # --------------------------------------------------------------------------- #
+# Groq API
+# --------------------------------------------------------------------------- #
+def _call_groq(model_name: str, prompt: str, use_search: bool) -> str:
+    """Call Groq chat completions API with browser search tool."""
+    tools = []
+    if use_search:
+        tools = [{"type": "browser_search"}]
+    
+    payload = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "max_completion_tokens": MAX_OUTPUT_TOKENS,
+        "reasoning_effort": "low",
+        "tools": tools,
+    }
+    
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=120,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data["choices"][0]["message"]["content"]
+
+
+def generate_groq(contents: list[Any]) -> str:
+    """Call Groq with model fallbacks and rate-limit retries."""
+    # For Groq, we only use the first content item (the prompt string)
+    # and ignore multimodal parts since gpt-oss is text-only
+    prompt = str(contents[0]) if contents else ""
+    
+    last_error: Exception | None = None
+    for model_name in GROQ_FALLBACK_MODELS:
+        for attempt in range(3):
+            try:
+                use_search = SEARCH_GROUNDING
+                response_text = _call_groq(model_name, prompt, use_search)
+                
+                text = (response_text or "").strip()
+                if text:
+                    return text
+                last_error = RuntimeError(f"empty response from {model_name}")
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if _is_groq_auth_error(exc):
+                    raise RuntimeError(
+                        "GROQ_API_KEY was rejected by the Groq API. Check that it is a "
+                        "valid key from https://console.groq.com/keys and that the account "
+                        "has access to the requested models."
+                    ) from exc
+                if _is_rate_limit(exc):
+                    wait = 30 * (attempt + 1)
+                    print(f"[groq] rate limited on {model_name}; sleeping {wait}s")
+                    time.sleep(wait)
+                    continue
+                print(f"[groq] {model_name} failed: {_short_error(exc)}")
+                break
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Groq call failed for an unknown reason")
+
+
+# --------------------------------------------------------------------------- #
 # Gemini
 # --------------------------------------------------------------------------- #
-def get_gemini_api_key() -> str | None:
-    return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-
-
 _CLIENT: Any = None
 
 
@@ -502,7 +663,7 @@ def _call_model(client, model_name: str, contents: list[Any], use_search: bool) 
     )
 
 
-def generate(contents: list[Any]) -> str:
+def generate_gemini(contents: list[Any]) -> str:
     """Call Gemini with model fallbacks and rate-limit retries.
 
     Every call is made with Google Search grounding enabled, so the model can
@@ -536,7 +697,7 @@ def generate(contents: list[Any]) -> str:
                 break
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
-                if _is_auth_error(exc):
+                if _is_gemini_auth_error(exc):
                     raise RuntimeError(
                         "GEMINI_API_KEY was rejected by the Gemini API. Check that it is a "
                         "Google AI Studio key (https://aistudio.google.com/apikey) created "
@@ -554,6 +715,23 @@ def generate(contents: list[Any]) -> str:
     if last_error is not None:
         raise last_error
     raise RuntimeError("Gemini call failed for an unknown reason")
+
+
+# --------------------------------------------------------------------------- #
+# Unified generate dispatcher
+# --------------------------------------------------------------------------- #
+def generate(contents: list[Any]) -> str:
+    """Dispatch to the appropriate provider based on available API keys."""
+    provider = get_provider()
+    if provider == "groq":
+        return generate_groq(contents)
+    elif provider == "gemini":
+        return generate_gemini(contents)
+    else:
+        raise RuntimeError(
+            "No LLM provider configured. Set either GROQ_API_KEY (for Groq/GPT-OSS) "
+            "or GEMINI_API_KEY/GOOGLE_API_KEY (for Gemini)."
+        )
 
 
 def parse_action(text: str):
@@ -641,7 +819,7 @@ EVIDENCE:
 
 
 class GaiaAgent:
-    """A bounded ReAct research agent built on Gemini + web tools."""
+    """A bounded ReAct research agent built on Gemini/Groq + web tools."""
 
     def __init__(self, delay_seconds: float = 1.0):
         self.delay_seconds = delay_seconds
@@ -659,12 +837,17 @@ class GaiaAgent:
         youtube_parts: list[Any] = []
         for url in YOUTUBE_RE.findall(question):
             full = f"https://www.youtube.com/watch?v={url}"
-            try:
-                youtube_parts.append(
-                    types.Part(file_data=types.FileData(file_uri=full))
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"[youtube] attach failed: {_short_error(exc)}")
+            provider = get_provider()
+            if provider == "gemini":
+                try:
+                    youtube_parts.append(
+                        types.Part(file_data=types.FileData(file_uri=full))
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[youtube] attach failed: {_short_error(exc)}")
+            else:
+                # Groq provider - can't attach video, just note it
+                file_note += f" — [Groq provider] YouTube video at {full} could not be viewed"
             transcript = youtube_transcript(full)
             if transcript:
                 observations.append(f"YOUTUBE TRANSCRIPT ({full}):\n{transcript}")
@@ -740,15 +923,16 @@ def fetch_questions() -> list[dict]:
 # UI actions
 # --------------------------------------------------------------------------- #
 def _run(limit: int, submit: bool, profile, progress) -> tuple[str, pd.DataFrame]:
-    if submit and not profile:
-        return "Please log in with Hugging Face before submitting.", None
-
-    if not get_gemini_api_key():
+    provider = get_provider()
+    if provider == "none":
         return (
-            "Missing GEMINI_API_KEY. Add it under Settings → Variables and secrets "
-            "in this Space, then restart.",
+            "No LLM provider configured. Set either GROQ_API_KEY (for Groq/GPT-OSS) "
+            "or GEMINI_API_KEY/GOOGLE_API_KEY (for Gemini) as a Space secret, then restart.",
             None,
         )
+
+    if submit and not profile:
+        return "Please log in with Hugging Face before submitting.", None
 
     try:
         questions = fetch_questions()
@@ -902,6 +1086,15 @@ if __name__ == "__main__":
         print(f"Repo: https://huggingface.co/spaces/{os.getenv('SPACE_ID')}/tree/main")
     if os.getenv("SPACE_HOST"):
         print(f"Runtime: https://{os.getenv('SPACE_HOST')}.hf.space")
+    
+    provider = get_provider()
+    if provider == "groq":
+        print(f"Provider: Groq (model: {GROQ_MODEL})")
+    elif provider == "gemini":
+        print(f"Provider: Gemini (model: {GEMINI_MODEL})")
+    else:
+        print("Provider: NONE (no API key configured)")
+    
     print("-" * 75 + "\n")
 
     demo.queue(default_concurrency_limit=1)
