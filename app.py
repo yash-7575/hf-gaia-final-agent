@@ -53,6 +53,8 @@ MAX_FETCHED_PAGES = int(os.getenv("MAX_FETCHED_PAGES", "2"))
 PAGE_CHARS = int(os.getenv("PAGE_CHARS", "6000"))
 FILE_CHARS = int(os.getenv("FILE_CHARS", "20000"))
 MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "8192"))
+SEARCH_HTTP_TIMEOUT = int(os.getenv("SEARCH_HTTP_TIMEOUT", "10"))
+SEARCH_GROUNDING = os.getenv("DISABLE_SEARCH_GROUNDING", "0") != "1"
 REQUEST_TIMEOUT = 20
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -88,6 +90,7 @@ def clean_answer(text: str) -> str:
 
     text = re.sub(r"(?is)^(final\s+answer|answer)\s*[:\-]\s*", "", text)
     text = re.sub(r"(?is)^the\s+answer\s+is\s*[:\-]?\s*", "", text)
+    text = re.sub(r"\[\d+\]", "", text)  # search-grounding citation markers
     text = text.strip().strip("`").strip()
     if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
         text = text[1:-1].strip()
@@ -96,7 +99,21 @@ def clean_answer(text: str) -> str:
 
 def _is_rate_limit(error: Exception) -> bool:
     msg = str(error).lower()
-    return "429" in msg or "rate" in msg or "quota" in msg or "resource_exhausted" in msg
+    return (
+        "429" in msg
+        or "resource_exhausted" in msg
+        or "rate limit" in msg
+        or "quota exceeded" in msg
+    )
+
+
+def _is_auth_error(error: Exception) -> bool:
+    msg = str(error).lower()
+    return (
+        "api key not valid" in msg
+        or "unauthenticated" in msg
+        or "permission denied" in msg
+    )
 
 
 def _short_error(error: Exception) -> str:
@@ -107,61 +124,74 @@ def _short_error(error: Exception) -> str:
 # Web tools
 # --------------------------------------------------------------------------- #
 def web_search(query: str, max_results: int = MAX_SEARCH_RESULTS) -> list[dict]:
-    """DuckDuckGo search with a resilient HTML fallback."""
+    """DuckDuckGo search (lite endpoint first) with resilient fallbacks."""
     query = (query or "").strip()
     if not query:
         return []
+
+    endpoints = (
+        f"https://lite.duckduckgo.com/lite/?q={quote_plus(query)}",
+        f"https://html.duckduckgo.com/html/?q={quote_plus(query)}",
+    )
+    for endpoint in endpoints:
+        try:
+            response = requests.get(
+                endpoint, headers={"User-Agent": USER_AGENT}, timeout=SEARCH_HTTP_TIMEOUT
+            )
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+            results = []
+
+            nodes = soup.select(".result") or soup.select("a.result-link")
+            for node in nodes:
+                title_tag = node.select_one(".result__a") or node
+                href = title_tag.get("href", "")
+                if "uddg=" in href:
+                    href = parse_qs(urlparse(href).query).get("uddg", [href])[0]
+                snippet_tag = node.select_one(".result__snippet")
+                results.append(
+                    {
+                        "title": title_tag.get_text(" ", strip=True),
+                        "url": href,
+                        "snippet": snippet_tag.get_text(" ", strip=True) if snippet_tag else "",
+                    }
+                )
+                if len(results) >= max_results:
+                    break
+
+            if not results:  # lite endpoint uses a flat link list
+                for node in soup.select("td a[href^='http']"):
+                    href = node.get("href", "")
+                    if "uddg=" in href:
+                        href = parse_qs(urlparse(href).query).get("uddg", [href])[0]
+                    if href.startswith("http"):
+                        results.append(
+                            {"title": node.get_text(" ", strip=True), "url": href, "snippet": ""}
+                        )
+                    if len(results) >= max_results:
+                        break
+
+            if results:
+                return results
+        except Exception as exc:  # noqa: BLE001
+            print(f"[search] {urlparse(endpoint).hostname} failed: {_short_error(exc)}")
 
     try:
         from ddgs import DDGS
 
         with DDGS() as ddgs:
-            raw = list(ddgs.text(query, max_results=max_results))
-        results = []
-        for item in raw:
-            url = item.get("href") or item.get("url") or ""
-            if url:
-                results.append(
-                    {
-                        "title": item.get("title", ""),
-                        "url": url,
-                        "snippet": item.get("body", ""),
-                    }
-                )
-        if results:
-            return results
-    except Exception as exc:  # noqa: BLE001 - search backends fail often
-        print(f"[search] ddgs failed: {_short_error(exc)}")
-
-    try:
-        response = requests.get(
-            f"https://html.duckduckgo.com/html/?q={quote_plus(query)}",
-            headers={"User-Agent": USER_AGENT},
-            timeout=REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        results = []
-        for node in soup.select(".result"):
-            title_tag = node.select_one(".result__a")
-            if not title_tag:
-                continue
-            href = title_tag.get("href", "")
-            if "uddg=" in href:
-                href = parse_qs(urlparse(href).query).get("uddg", [href])[0]
-            snippet_tag = node.select_one(".result__snippet")
-            results.append(
-                {
-                    "title": title_tag.get_text(" ", strip=True),
-                    "url": href,
-                    "snippet": snippet_tag.get_text(" ", strip=True) if snippet_tag else "",
-                }
-            )
-            if len(results) >= max_results:
-                break
-        return results
+            raw = list(ddgs.text(query, max_results=max_results, backend="duckduckgo"))
+        return [
+            {
+                "title": item.get("title", ""),
+                "url": item.get("href") or item.get("url") or "",
+                "snippet": item.get("body", ""),
+            }
+            for item in raw
+            if item.get("href") or item.get("url")
+        ]
     except Exception as exc:  # noqa: BLE001
-        print(f"[search] html fallback failed: {_short_error(exc)}")
+        print(f"[search] ddgs fallback failed: {_short_error(exc)}")
         return []
 
 
@@ -212,7 +242,7 @@ def wikipedia_summary(query: str) -> str:
                 "srlimit": 1,
             },
             headers={"User-Agent": USER_AGENT},
-            timeout=REQUEST_TIMEOUT,
+            timeout=SEARCH_HTTP_TIMEOUT,
         )
         search.raise_for_status()
         hits = search.json().get("query", {}).get("search", [])
@@ -222,7 +252,7 @@ def wikipedia_summary(query: str) -> str:
         summary = requests.get(
             f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote_plus(title)}",
             headers={"User-Agent": USER_AGENT},
-            timeout=REQUEST_TIMEOUT,
+            timeout=SEARCH_HTTP_TIMEOUT,
         )
         summary.raise_for_status()
         data = summary.json()
@@ -449,12 +479,14 @@ def get_client():
     return _CLIENT
 
 
-def config_for_model(model_name: str) -> types.GenerateContentConfig:
-    """Temperature 0, with a bounded thinking budget on 2.5 models only."""
+def config_for_model(model_name: str, use_search: bool) -> types.GenerateContentConfig:
+    """Temperature 0, bounded thinking on 2.5 models, optional search grounding."""
     kwargs: dict[str, Any] = {
         "temperature": 0,
         "max_output_tokens": MAX_OUTPUT_TOKENS,
     }
+    if use_search:
+        kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
     if model_name.startswith("gemini-2.5"):
         kwargs["thinking_config"] = types.ThinkingConfig(
             thinking_budget=int(os.getenv("GEMINI_THINKING_BUDGET", "2048"))
@@ -462,19 +494,41 @@ def config_for_model(model_name: str) -> types.GenerateContentConfig:
     return types.GenerateContentConfig(**kwargs)
 
 
+def _call_model(client, model_name: str, contents: list[Any], use_search: bool) -> Any:
+    return client.models.generate_content(
+        model=model_name,
+        contents=contents,
+        config=config_for_model(model_name, use_search=use_search),
+    )
+
+
 def generate(contents: list[Any]) -> str:
-    """Call Gemini with model fallbacks and rate-limit retries."""
+    """Call Gemini with model fallbacks and rate-limit retries.
+
+    Every call is made with Google Search grounding enabled, so the model can
+    run its own live Google searches; if a model rejects the tool the call is
+    retried without it.
+    """
     client = get_client()
 
     last_error: Exception | None = None
     for model_name in GEMINI_FALLBACK_MODELS:
         for attempt in range(3):
             try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=config_for_model(model_name),
-                )
+                try:
+                    response = _call_model(client, model_name, contents, use_search=SEARCH_GROUNDING)
+                except Exception as exc:  # noqa: BLE001
+                    if SEARCH_GROUNDING and not _is_rate_limit(exc):
+                        print(
+                            f"[gemini] {model_name} rejected search grounding; retrying without: "
+                            f"{_short_error(exc)}"
+                        )
+                        response = _call_model(
+                            client, model_name, contents, use_search=False
+                        )
+                    else:
+                        raise
+
                 text = (getattr(response, "text", "") or "").strip()
                 if text:
                     return text
@@ -482,6 +536,11 @@ def generate(contents: list[Any]) -> str:
                 break
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
+                if _is_auth_error(exc):
+                    raise RuntimeError(
+                        "GEMINI_API_KEY was rejected (401). Use a Google AI Studio key "
+                        "from https://aistudio.google.com/apikey — it starts with 'AIza'."
+                    ) from exc
                 if _is_rate_limit(exc):
                     wait = 20 * (attempt + 1)
                     print(f"[gemini] rate limited on {model_name}; sleeping {wait}s")
